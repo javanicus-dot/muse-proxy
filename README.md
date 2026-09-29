@@ -1,0 +1,123 @@
+# Meta Muse.ai OpenAI-Compatible Reverse Proxy
+
+High-performance, multi-account OpenAI-compatible API reverse proxy for Meta Muse.ai (`muse-spark-1.3`), powered by headless Chromium via Patchright.
+
+## Features
+
+- **OpenAI Standard Compatibility**: Supports `/v1/chat/completions` (streaming & non-streaming) and `/v1/models`.
+- **Multi-Account Load Balancing**: Automatically rotates requests across accounts listed in `cookies.txt` using Round-Robin.
+- **Failover & Fault Tolerance**: Automatically reroutes requests to the next account if an account encounters an error or rate limit.
+- **Hot-Reloading**: Automatically detects modifications to `cookies.txt` without restarting the process.
+- **Zero External Proxy Needed**: Connects directly to Muse.ai with native browser stealth.
+- **Real Capacity Specs**: Configured for 350,000 tokens context window and 4,096 max completion tokens.
+
+## Architecture
+
+```
+OpenAI Client / 9Router / Hermes / Cline / Cursor
+                   │
+                   ▼  (HTTP POST /v1/chat/completions)
+          [ Muse Proxy Server ]  (Port 20133)
+                   │
+         [ Dedicated Worker Thread ]
+         ├── Context #0 (Account 1 - Chromium Tab)
+         ├── Context #1 (Account 2 - Chromium Tab)
+         └── Context #N ...
+                   │
+                   ▼  (Direct HTTPS)
+             https://muse.ai/
+```
+
+## Quick Start
+
+### 1. Requirements
+
+- Python 3.10+
+- Patchright (Chromium headless)
+
+```bash
+pip install -r requirements.txt
+patchright install chromium
+```
+
+### 2. Configure Cookies
+
+Copy `cookies.example.txt` to `cookies.txt`:
+
+```bash
+cp cookies.example.txt cookies.txt
+```
+
+Paste your browser cookies into `cookies.txt` (one line per account):
+
+```text
+# Account 1
+datr=xxx; hatch_native_auth_device=xxx; hatch_sess=xxx; hatch_gw=xxx;
+
+# Account 2
+datr=yyy; hatch_native_auth_device=yyy; hatch_sess=yyy; hatch_gw=yyy;
+```
+
+### 3. Run the Server
+
+```bash
+python3 server.py
+```
+
+Or using PM2 for background daemon management:
+
+```bash
+pm2 start server.py --name muse-proxy --interpreter python3
+```
+
+## API Endpoints
+
+### 1. Chat Completions (`POST /v1/chat/completions`)
+
+Standard OpenAI payload:
+
+```bash
+curl http://127.0.0.1:20133/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "muse-spark-1.3",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+```
+
+### 2. List Models (`GET /v1/models`)
+
+```bash
+curl http://127.0.0.1:20133/v1/models
+```
+
+### 3. Health & Pool Status (`GET /health`)
+
+```bash
+curl http://127.0.0.1:20133/health
+```
+
+Returns pool status:
+
+```json
+{
+  "status": "ok",
+  "provider": "muse-spark-1.3",
+  "models": ["muse-spark-1.3"],
+  "pool": {
+    "total_accounts": 2,
+    "active_accounts": 2,
+    "accounts": [
+      {"index": 0, "active": true, "total_requests": 14, "consecutive_errors": 0},
+      {"index": 1, "active": true, "total_requests": 13, "consecutive_errors": 0}
+    ]
+  }
+}
+```
+
+### 4. Hot Reload Cookies (`POST /reload` or `GET /reload`)
+
+```bash
+curl http://127.0.0.1:20133/reload
+```

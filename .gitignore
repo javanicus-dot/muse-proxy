@@ -1,0 +1,17 @@
+# Sesi, cookies & kredensial
+cookies.txt
+*.json
+proxies.txt
+.env
+
+# Output pengujian & dumps
+*.png
+*.html
+*.log
+
+# Python cache & runtime
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/

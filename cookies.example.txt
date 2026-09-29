@@ -1,0 +1,5 @@
+# Contoh format isi file cookies.txt untuk Meta Muse.ai
+# Masukkan cookie string lengkap dari browser (1 baris per akun)
+# Sistem akan otomatis membaca dan melakukan load balancing (Round-Robin)
+
+datr=xxx; hatch_native_auth_device=xxx; theme=...; hatch_sess=xxx; hatch_gw=xxx;
