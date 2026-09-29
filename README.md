@@ -1,12 +1,14 @@
 # Meta Muse.ai OpenAI-Compatible Reverse Proxy
 
-High-performance, multi-account OpenAI-compatible API reverse proxy for Meta Muse.ai (`muse-spark-1.3`), powered by headless Chromium via Patchright.
+High-performance, ultra-lightweight multi-account OpenAI-compatible API reverse proxy for Meta Muse.ai (`muse-spark-1.3`), powered by headless Chromium via Patchright.
 
 ## Features
 
 - **OpenAI Standard Compatibility**: Supports `/v1/chat/completions` (streaming & non-streaming) and `/v1/models`.
+- **Ultra-Lightweight Engine**: Images, fonts, and marketing trackers are blocked at the native engine level (`imagesEnabled=false`, compact 800x600 viewport), consuming only ~30 MB RAM per context.
 - **Multi-Account Load Balancing**: Automatically rotates requests across accounts listed in `cookies.txt` using Round-Robin.
 - **Failover & Fault Tolerance**: Automatically reroutes requests to the next account if an account encounters an error or rate limit.
+- **Auto Session Purge & Hygiene**: Automatically cleans chat sessions every 20 requests to prevent memory leaks and keep accounts completely clean.
 - **Hot-Reloading**: Automatically detects modifications to `cookies.txt` without restarting the process.
 - **Zero External Proxy Needed**: Connects directly to Muse.ai with native browser stealth.
 - **Real Capacity Specs**: Configured for 350,000 tokens context window and 4,096 max completion tokens.
@@ -20,12 +22,30 @@ OpenAI Client / 9Router / Hermes / Cline / Cursor
           [ Muse Proxy Server ]  (Port 20133)
                    │
          [ Dedicated Worker Thread ]
-         ├── Context #0 (Account 1 - Chromium Tab)
-         ├── Context #1 (Account 2 - Chromium Tab)
+         ├── Context #0 (Account 1 - Chromium Tab, 800x600, No Images)
+         ├── Context #1 (Account 2 - Chromium Tab, 800x600, No Images)
          └── Context #N ...
                    │
                    ▼  (Direct HTTPS)
              https://muse.ai/
+```
+
+## Repository Structure
+
+```
+muse-proxy/
+├── server.py              # Main ultra-lightweight reverse proxy server
+├── cookies.example.txt    # Example template for multi-account cookies
+├── requirements.txt       # Python dependencies
+├── README.md              # Project documentation
+└── tools/                 # Account creation, OTP, and verification automation scripts
+    ├── register_muse.py
+    ├── fb_register.py
+    ├── auth_meta_and_verify.py
+    ├── solve_fb_and_link.py
+    ├── oauth_link.py
+    ├── tempmail_api.py
+    └── ...
 ```
 
 ## Quick Start
@@ -109,8 +129,8 @@ Returns pool status:
     "total_accounts": 2,
     "active_accounts": 2,
     "accounts": [
-      {"index": 0, "active": true, "total_requests": 14, "consecutive_errors": 0},
-      {"index": 1, "active": true, "total_requests": 13, "consecutive_errors": 0}
+      {"index": 0, "active": true, "total_requests": 14, "session_requests": 4, "consecutive_errors": 0},
+      {"index": 1, "active": true, "total_requests": 13, "session_requests": 3, "consecutive_errors": 0}
     ]
   }
 }
@@ -120,4 +140,12 @@ Returns pool status:
 
 ```bash
 curl http://127.0.0.1:20133/reload
+```
+
+### 5. Instant Session & Cache Purge (`POST /reset` or `GET /reset`)
+
+Clears all conversation memory, wipes browser session caches, and returns all account tabs to fresh blank states:
+
+```bash
+curl http://127.0.0.1:20133/reset
 ```

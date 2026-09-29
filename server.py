@@ -15,8 +15,27 @@ PORT = 20133
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
 
+# Auto-reset tab conversation after N requests to prevent memory leaks and keep accounts clean
+MAX_SESSION_REQUESTS = 20
+
 SUPPORTED_MODELS = [
     "muse-spark-1.3"
+]
+
+CHROMIUM_FLAGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-breakpad",
+    "--disable-default-apps",
+    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
+    "--mute-audio",
+    "--no-first-run",
+    "--blink-settings=imagesEnabled=false"
 ]
 
 logging.basicConfig(
@@ -56,7 +75,6 @@ def load_cookie_lines_from_file(file_path):
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):
                     continue
-                # Minimal sanity check: must contain key cookies or '='
                 if "=" in stripped:
                     valid_lines.append(stripped)
     except Exception as e:
@@ -73,6 +91,24 @@ class AccountSession:
         self.is_active = True
         self.consecutive_errors = 0
         self.total_requests = 0
+        self.session_requests = 0
+
+    def reset_chat_session(self):
+        try:
+            logger.info(f"Purging chat session & DOM cache for account #{self.idx}...")
+            self.page.evaluate("""() => {
+                try {
+                    localStorage.removeItem('hatch-thread-titles');
+                    localStorage.removeItem('hatch-last-seen-ts');
+                    sessionStorage.clear();
+                } catch(e) {}
+            }""")
+            self.page.goto("https://muse.ai/", wait_until="commit", timeout=30000)
+            time.sleep(2)
+            self.session_requests = 0
+            logger.info(f"Account #{self.idx} chat session reset completed.")
+        except Exception as e:
+            logger.error(f"Error resetting chat session for account #{self.idx}: {e}")
 
     def close(self):
         try:
@@ -100,16 +136,11 @@ class MultiAccountBrowserWorker(threading.Thread):
         self.last_mtime = 0
 
     def run(self):
-        logger.info("Initializing Playwright Chromium instance...")
+        logger.info("Initializing Ultra-Lightweight Playwright Chromium instance...")
         self.playwright = sync_playwright().start()
         self.browser = self.playwright.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu"
-            ]
+            args=CHROMIUM_FLAGS
         )
 
         self._sync_accounts()
@@ -134,6 +165,13 @@ class MultiAccountBrowserWorker(threading.Thread):
                     res_queue.put(("ok", count))
                 except Exception as e:
                     res_queue.put(("err", e))
+            elif action == "reset":
+                try:
+                    for acc in self.accounts:
+                        acc.reset_chat_session()
+                    res_queue.put(("ok", len(self.accounts)))
+                except Exception as e:
+                    res_queue.put(("err", e))
             elif action == "status":
                 status_info = {
                     "total_accounts": len(self.accounts),
@@ -143,6 +181,7 @@ class MultiAccountBrowserWorker(threading.Thread):
                             "index": a.idx,
                             "active": a.is_active,
                             "total_requests": a.total_requests,
+                            "session_requests": a.session_requests,
                             "consecutive_errors": a.consecutive_errors
                         }
                         for a in self.accounts
@@ -166,36 +205,32 @@ class MultiAccountBrowserWorker(threading.Thread):
 
         logger.info(f"Syncing accounts from cookies.txt ({len(lines)} line(s) detected)...")
 
-        # Compare existing cookies with new lines
         existing_cookie_map = {acc.cookie_str: acc for acc in self.accounts}
         new_accounts = []
 
         for idx, cookie_str in enumerate(lines):
             if cookie_str in existing_cookie_map:
-                # Reuse existing initialized account
                 acc = existing_cookie_map.pop(cookie_str)
                 acc.idx = idx
                 new_accounts.append(acc)
             else:
-                # Initialize new browser context and tab
                 try:
-                    logger.info(f"Spawning browser context for account index #{idx}...")
+                    logger.info(f"Spawning ultra-lightweight context for account #{idx}...")
                     ctx = self.browser.new_context(
-                        viewport={"width": 1280, "height": 800},
+                        viewport={"width": 800, "height": 600},
                         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
                     )
                     cookies = parse_cookie_line(cookie_str)
                     ctx.add_cookies(cookies)
                     page = ctx.new_page()
                     page.goto("https://muse.ai/", wait_until="commit", timeout=45000)
-                    time.sleep(3)
+                    time.sleep(2)
                     logger.info(f"Account #{idx} ready: {page.title()}")
                     acc = AccountSession(idx, cookie_str, ctx, page)
                     new_accounts.append(acc)
                 except Exception as e:
                     logger.error(f"Failed to initialize account #{idx}: {e}")
 
-        # Close obsolete accounts that were removed from cookies.txt
         for old_acc in existing_cookie_map.values():
             logger.info(f"Closing removed account #{old_acc.idx}")
             old_acc.close()
@@ -206,14 +241,12 @@ class MultiAccountBrowserWorker(threading.Thread):
         return len(self.accounts)
 
     def _execute_generate_with_failover(self, prompt):
-        # Auto-check if cookies.txt was modified on disk
         if os.path.exists(self.cookies_path):
             if os.path.getmtime(self.cookies_path) != self.last_mtime:
                 self._sync_accounts()
 
         active = [a for a in self.accounts if a.is_active]
         if not active:
-            # Try to reactivate accounts or reload
             self._sync_accounts(force=True)
             active = [a for a in self.accounts if a.is_active]
             if not active:
@@ -227,9 +260,14 @@ class MultiAccountBrowserWorker(threading.Thread):
         for i in range(num_accounts):
             acc = active[(start_idx + i) % num_accounts]
             try:
+                # If session has handled MAX_SESSION_REQUESTS, purge session before prompt
+                if acc.session_requests >= MAX_SESSION_REQUESTS:
+                    acc.reset_chat_session()
+
                 logger.info(f"Dispatching prompt to account #{acc.idx} (attempt {i + 1}/{num_accounts})...")
                 reply = self._generate_on_page(acc.page, prompt)
                 acc.total_requests += 1
+                acc.session_requests += 1
                 acc.consecutive_errors = 0
                 return reply, acc.idx
             except Exception as e:
@@ -290,13 +328,22 @@ class MultiAccountBrowserWorker(threading.Thread):
         self.req_queue.put(("generate", prompt, res_q))
         status, val = res_q.get(timeout=timeout)
         if status == "ok":
-            return val  # (text, account_idx)
+            return val
         else:
             raise val
 
     def reload_cookies(self, timeout=30):
         res_q = queue.Queue()
         self.req_queue.put(("reload", None, res_q))
+        status, val = res_q.get(timeout=timeout)
+        if status == "ok":
+            return val
+        else:
+            raise val
+
+    def reset_sessions(self, timeout=30):
+        res_q = queue.Queue()
+        self.req_queue.put(("reset", None, res_q))
         status, val = res_q.get(timeout=timeout)
         if status == "ok":
             return val
@@ -381,6 +428,20 @@ class MuseHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(res_bytes)))
             self.end_headers()
             self.wfile.write(res_bytes)
+        elif self.path in ["/reset", "/v1/reset"]:
+            try:
+                count = worker.reset_sessions()
+                res_payload = {"status": "ok", "reset_accounts": count}
+                self.send_response(200)
+            except Exception as e:
+                res_payload = {"status": "error", "message": str(e)}
+                self.send_response(500)
+            res_bytes = json.dumps(res_payload).encode("utf-8")
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.send_header("Content-Length", str(len(res_bytes)))
+            self.end_headers()
+            self.wfile.write(res_bytes)
         else:
             self.send_response(404)
             self._send_cors()
@@ -392,6 +453,22 @@ class MuseHTTPHandler(BaseHTTPRequestHandler):
             try:
                 count = worker.reload_cookies()
                 res_payload = {"status": "ok", "active_accounts": count}
+                self.send_response(200)
+            except Exception as e:
+                res_payload = {"status": "error", "message": str(e)}
+                self.send_response(500)
+            res_bytes = json.dumps(res_payload).encode("utf-8")
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.send_header("Content-Length", str(len(res_bytes)))
+            self.end_headers()
+            self.wfile.write(res_bytes)
+            return
+
+        if self.path in ["/reset", "/v1/reset"]:
+            try:
+                count = worker.reset_sessions()
+                res_payload = {"status": "ok", "reset_accounts": count}
                 self.send_response(200)
             except Exception as e:
                 res_payload = {"status": "error", "message": str(e)}
