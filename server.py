@@ -9,9 +9,10 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from patchright.sync_api import sync_playwright
+from vision import InvalidImageInput, MAX_REQUEST_BYTES, parse_chat_messages
 
-HOST = "0.0.0.0"
-PORT = 20133
+HOST = os.environ.get("MUSE_PROXY_HOST", "127.0.0.1")
+PORT = int(os.environ.get("MUSE_PROXY_PORT", "20133"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
 
@@ -152,9 +153,9 @@ class MultiAccountBrowserWorker(threading.Thread):
                 break
             action, payload, res_queue = item
             if action == "generate":
-                prompt = payload
+                prompt, images = payload
                 try:
-                    ans, acc_idx = self._execute_generate_with_failover(prompt)
+                    ans, acc_idx = self._execute_generate_with_failover(prompt, images)
                     res_queue.put(("ok", (ans, acc_idx)))
                 except Exception as e:
                     logger.error(f"Generate failover error: {e}")
@@ -240,7 +241,7 @@ class MultiAccountBrowserWorker(threading.Thread):
         logger.info(f"Account pool updated. Active accounts: {len(self.accounts)}")
         return len(self.accounts)
 
-    def _execute_generate_with_failover(self, prompt):
+    def _execute_generate_with_failover(self, prompt, images):
         if os.path.exists(self.cookies_path):
             if os.path.getmtime(self.cookies_path) != self.last_mtime:
                 self._sync_accounts()
@@ -265,7 +266,7 @@ class MultiAccountBrowserWorker(threading.Thread):
                     acc.reset_chat_session()
 
                 logger.info(f"Dispatching prompt to account #{acc.idx} (attempt {i + 1}/{num_accounts})...")
-                reply = self._generate_on_page(acc.page, prompt)
+                reply = self._generate_on_page(acc.page, prompt, images)
                 acc.total_requests += 1
                 acc.session_requests += 1
                 acc.consecutive_errors = 0
@@ -280,11 +281,40 @@ class MultiAccountBrowserWorker(threading.Thread):
 
         raise Exception(f"All {num_accounts} accounts in pool failed. Last error: {last_err}")
 
-    def _generate_on_page(self, page, prompt):
+    def _attach_images(self, page, images):
+        file_inputs = page.locator('input[type="file"]')
+        candidates = [file_inputs.nth(index) for index in range(file_inputs.count())]
+        candidates.sort(key=lambda item: "image" not in (item.get_attribute("accept") or "").lower())
+        for file_input in candidates:
+            accepted = (file_input.get_attribute("accept") or "").lower()
+            if accepted and not any(
+                item in accepted for item in ("image", ".jpg", ".jpeg", ".png", ".gif", ".webp")
+            ):
+                continue
+            if len(images) > 1 and file_input.get_attribute("multiple") is None:
+                raise RuntimeError("Muse image upload control accepts only one image at a time")
+            file_input.set_input_files([image.as_file_payload() for image in images], timeout=15000)
+            time.sleep(0.5)
+            return
+        raise RuntimeError("Muse page has no image upload control; the image was not sent")
+
+    @staticmethod
+    def _latest_assistant_info(page):
+        return page.evaluate("""() => {
+            const nodes = document.querySelectorAll('div[class*="leading-relaxed"], div[class*="prose"], div[data-message-author-role="assistant"]');
+            if (!nodes || nodes.length === 0) return { count: 0, text: "" };
+            const lastNode = nodes[nodes.length - 1];
+            return { count: nodes.length, text: (lastNode.innerText || "").trim() };
+        }""")
+
+    def _generate_on_page(self, page, prompt, images):
         textarea = page.locator("textarea").first
         textarea.wait_for(state="visible", timeout=15000)
 
+        if images:
+            self._attach_images(page, images)
         textarea.fill(prompt)
+        previous_info = self._latest_assistant_info(page)
         time.sleep(0.1)
         textarea.press("Enter")
 
@@ -302,16 +332,14 @@ class MultiAccountBrowserWorker(threading.Thread):
             except Exception:
                 pass
 
-            latest_info = page.evaluate("""() => {
-                const nodes = document.querySelectorAll('div[class*="leading-relaxed"], div[class*="prose"], div[data-message-author-role="assistant"]');
-                if (!nodes || nodes.length === 0) return { count: 0, text: "" };
-                const lastNode = nodes[nodes.length - 1];
-                return { count: nodes.length, text: (lastNode.innerText || "").trim() };
-            }""")
+            latest_info = self._latest_assistant_info(page)
 
             cur_text = latest_info.get("text", "")
 
-            if cur_text:
+            if cur_text and (
+                latest_info.get("count", 0) > previous_info.get("count", 0)
+                or cur_text != previous_info.get("text", "")
+            ):
                 if cur_text == last_text:
                     stable_cycles += 1
                     if not is_stop_visible and stable_cycles >= 2:
@@ -323,9 +351,9 @@ class MultiAccountBrowserWorker(threading.Thread):
 
         raise Exception("Muse.ai did not return response within timeout.")
 
-    def generate(self, prompt, timeout=120):
+    def generate(self, prompt, images=None, timeout=120):
         res_q = queue.Queue()
-        self.req_queue.put(("generate", prompt, res_q))
+        self.req_queue.put(("generate", (prompt, images or []), res_q))
         status, val = res_q.get(timeout=timeout)
         if status == "ok":
             return val
@@ -488,7 +516,17 @@ class MuseHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":"Not Found"}')
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_length = -1
+        if content_length < 0 or content_length > MAX_REQUEST_BYTES:
+            self.send_response(413 if content_length > MAX_REQUEST_BYTES else 400)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(b'{"error":"Invalid or oversized request body"}')
+            return
         post_data = self.rfile.read(content_length)
 
         try:
@@ -499,33 +537,28 @@ class MuseHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error":"Invalid JSON"}')
             return
+        if not isinstance(req_json, dict):
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(b'{"error":"Request body must be an object"}')
+            return
 
-        messages = req_json.get("messages", [])
+        try:
+            full_prompt, images = parse_chat_messages(req_json.get("messages", []))
+        except InvalidImageInput as e:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+            return
         model = req_json.get("model", "muse-spark-1.3")
         stream = req_json.get("stream", False)
 
-        prompt_parts = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_items = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
-                content = "\n".join(text_items)
-
-            if role == "system":
-                prompt_parts.append(f"[System Instruction]\n{content}")
-            elif role == "assistant":
-                prompt_parts.append(f"Assistant: {content}")
-            else:
-                prompt_parts.append(f"{content}")
-
-        if len(prompt_parts) == 1:
-            full_prompt = prompt_parts[0]
-        else:
-            full_prompt = "\n\n".join(prompt_parts)
-
         try:
-            reply, acc_idx = worker.generate(full_prompt)
+            reply, acc_idx = worker.generate(full_prompt, images)
         except Exception as e:
             self.send_response(500)
             self._send_cors()
@@ -594,13 +627,14 @@ class MuseHTTPHandler(BaseHTTPRequestHandler):
                         },
                         "finish_reason": "stop"
                     }
-                ],
-                "usage": {
+                ]
+            }
+            if not images:
+                res_obj["usage"] = {
                     "prompt_tokens": len(full_prompt) // 4,
                     "completion_tokens": len(reply) // 4,
                     "total_tokens": (len(full_prompt) + len(reply)) // 4
                 }
-            }
             res_bytes = json.dumps(res_obj).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

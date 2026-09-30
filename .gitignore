@@ -8,6 +8,7 @@ proxies.txt
 *.png
 *.html
 *.log
+*.swp
 
 # Python cache & runtime
 __pycache__/

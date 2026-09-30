@@ -84,6 +84,8 @@ datr=yyy; hatch_native_auth_device=yyy; hatch_sess=yyy; hatch_gw=yyy;
 python3 server.py
 ```
 
+The server listens on `127.0.0.1:20133` by default. Set `MUSE_PROXY_HOST` and `MUSE_PROXY_PORT` to change the bind address and port. If 9Router runs in Docker, bind to the host's Docker bridge gateway address and use that address in 9Router's provider Base URL. The proxy has no API-key check, so do not expose its port to untrusted networks.
+
 Or using PM2 for background daemon management:
 
 ```bash
@@ -111,6 +113,30 @@ curl http://127.0.0.1:20133/v1/chat/completions \
 ```bash
 curl http://127.0.0.1:20133/v1/models
 ```
+
+### Image understanding with Chat Completions
+
+Send an image in a `user` message as an OpenAI `image_url` content part. The proxy accepts base64 data URLs for JPEG, PNG, GIF, and WebP, with up to four images of 10 MB each per request. It uploads the image bytes through the Muse browser composer before sending the text prompt.
+
+```json
+{
+  "model": "muse-spark-1.3",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What is in this picture?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64_PNG_BYTES>"}}
+      ]
+    }
+  ],
+  "stream": false
+}
+```
+
+Use an actual base64 string in place of `<BASE64_PNG_BYTES>`. Remote image URLs and file IDs are not supported. If the Muse page has no image upload control, the request fails rather than sending a text-only prompt. The browser automation depends on Muse's current page layout, so verify one image request with your account before relying on it. Image token usage is omitted because this proxy cannot count it accurately.
+
+When routing through 9Router, configure the custom model as vision-capable and test an image request through 9Router itself. Some 9Router versions can hide image input or route it to another model based on the model's capability settings.
 
 ### 3. Health & Pool Status (`GET /health`)
 
